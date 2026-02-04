@@ -1,7 +1,10 @@
 #include "core/graph.h"
 #include <algorithm>
+#include <cstdio>
 #include <numeric>
 #include <queue>
+#include "operators/transpose.h"
+#include "operators/matmul.h"
 
 namespace infini
 {
@@ -17,6 +20,7 @@ namespace infini
                 input->addTarget(op);
                 if (auto pred = input->getSource())
                 {
+                    // 更新前驱和后继关系
                     pred->addSuccessors(op);
                     op->addPredecessors(pred);
                 }
@@ -106,6 +110,150 @@ namespace infini
         // 1. 去除冗余的算子（例如，两个相邻的算子都是 transpose 算子，且做的是相反的操作，可以将其全部删除）
         // 2. 合并算子（例如，矩阵乘算子中含有属性transA、transB，如果其输入存在transpose，且对最后两个维度做交换，就可以将transpose融入到矩阵乘算子的属性中去）
         // =================================== 作业 ===================================
+        // 确保图是拓扑排序的，以便按计算顺序遍历
+        if (!sorted) {
+            topo_sort();
+        }
+
+        // 辅助函数：断开算子与图中其他元素的连接
+        auto disconnectOperator = [&](const Operator &op) {
+            for (auto pred : op->getPredecessors()) {
+                pred->removeSuccessors(op);
+            }
+            for (auto succ : op->getSuccessors()) {
+                succ->removePredecessors(op);
+            }
+            for (auto input : op->getInputs()) {
+                input->removeTarget(op);
+            }
+            for (auto output : op->getOutputs()) {
+                output->setSource(nullptr);
+            }
+        };
+
+        // 辅助函数：检查 transpose 是否只交换最后两个维度
+        auto isLastTwoDimsSwap = [](const std::vector<int> &perm) -> bool {
+            for (size_t i = 0; i < perm.size(); ++i) {
+                if (i == perm.size() - 2) {
+                    if (perm[i] != (int)perm.size() - 1) return false;
+                } else if (i == perm.size() - 1) {
+                    if (perm[i] != (int)perm.size() - 2) return false;
+                } else {
+                    if (perm[i] != (int)i) return false;
+                }
+            }
+            return true;
+        };
+
+        // 使用集合避免重复标记
+        std::unordered_set<Operator> operatorsToRemoveSet;
+
+        // 规则 1: 消除冗余的 transpose 对
+        for (size_t i = 0; i < ops.size(); ++i) {
+            auto op1 = ops[i];
+            if (op1->getOpType() != OpType::Transpose) continue;
+            if (operatorsToRemoveSet.count(op1)) continue; // 已标记移除
+
+            auto transpose1 = as<TransposeObj>(op1);
+            auto perm1 = transpose1->getPermute();
+            auto output1 = op1->getOutput();
+            if (!output1) continue;
+
+            // 查找直接后继中的 transpose 算子
+            auto successors = op1->getSuccessors();
+            for (auto op2 : successors) {
+                if (op2->getOpType() != OpType::Transpose) continue;
+                if (operatorsToRemoveSet.count(op2)) continue; // 已标记移除
+
+                auto transpose2 = as<TransposeObj>(op2);
+                auto perm2 = transpose2->getPermute();
+                if (perm1 != perm2) continue; // 需要相同的 permutation（互逆）
+
+                // 找到匹配的 transpose 对，将其绕过
+                auto input1 = op1->getInputs(0);
+                auto output2 = op2->getOutput();
+
+                // 将 op2 的所有消费者重定向到 op1 的输入
+                auto consumers = output2->getTargets();
+                for (auto consumer : consumers) {
+                    consumer->replaceInput(output2, input1);
+                    output2->removeTarget(consumer);
+                    input1->addTarget(consumer);
+                }
+
+                // 清理中间 tensor 的连接
+                output1->removeTarget(op2);
+                output1->setSource(nullptr);
+                output2->setSource(nullptr);
+
+                operatorsToRemoveSet.insert(op1);
+                operatorsToRemoveSet.insert(op2);
+                break; // 处理第一个匹配的后继
+            }
+        }
+
+        // 规则 2: 将 transpose 合并到 matmul
+        auto opsCopy = ops; // 复制列表，因为遍历过程中可能修改 ops
+        for (auto op : opsCopy) {
+            if (op->getOpType() != OpType::MatMul) continue;
+
+            auto matmul = as<MatmulObj>(op);
+
+            // 检查两个输入
+            for (int idx = 0; idx < 2; ++idx) {
+                auto input = op->getInputs(idx);
+                auto source = input->getSource();
+                if (!source || source->getOpType() != OpType::Transpose) continue;
+                if (operatorsToRemoveSet.count(source)) continue; // 已标记移除
+
+                auto transpose = as<TransposeObj>(source);
+                auto perm = transpose->getPermute();
+                if (!isLastTwoDimsSwap(perm)) continue;
+
+                // 合并 transpose 到 matmul
+                auto transposeInput = source->getInputs(0);
+
+                // 更新 matmul 的输入
+                op->replaceInput(input, transposeInput);
+                input->removeTarget(op);
+                transposeInput->addTarget(op);
+
+                // 设置 transA/transB 属性
+                if (idx == 0) {
+                    matmul->setTransA(!matmul->getTransA());
+                } else {
+                    matmul->setTransB(!matmul->getTransB());
+                }
+
+                // 标记 transpose 等待移除
+                operatorsToRemoveSet.insert(source);
+
+                // 断开 transpose 输出的连接
+                auto transposeOutput = source->getOutput();
+                if (transposeOutput) {
+                    transposeOutput->setSource(nullptr);
+                }
+            }
+        }
+
+        // 移除所有标记的算子
+        for (auto op : operatorsToRemoveSet) {
+            disconnectOperator(op);
+            removeOperator(op);
+        }
+
+        // 清理孤立的 tensor（没有 source 且没有 target）
+        for (auto it = tensors.begin(); it != tensors.end(); ) {
+            auto tensor = *it;
+            if (!tensor->getSource() && tensor->getTargets().empty()) {
+                it = tensors.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        // 优化后图结构可能已改变，标记为未排序状态
+        sorted = false;
     }
 
     Tensor GraphObj::getTensor(int fuid) const
@@ -152,6 +300,17 @@ namespace infini
         // TODO：利用 allocator 给计算图分配内存
         // HINT: 获取分配好的内存指针后，可以调用 tensor 的 setDataBlob 函数给 tensor 绑定内存
         // =================================== 作业 ===================================
+        vector<size_t> offsets(tensors.size());
+        for (size_t i = 0; i < tensors.size(); ++i)
+        {
+            offsets[i] = allocator.alloc(tensors[i]->getBytes());
+        }
+        void *base_ptr = allocator.getPtr();
+        for (size_t i = 0; i < tensors.size(); ++i)
+        {
+            Blob blob = make_ref<BlobObj>(runtime, (char *)base_ptr + offsets[i]);
+            tensors[i]->setDataBlob(blob);
+        }
 
         allocator.info();
     }

@@ -20,7 +20,9 @@ namespace infini
         int dim;
 
         DataType dtype;
+        /* 使用该张量的算子 */
         vector<WRef<OperatorObj>> targets;
+        /* 产生该张量的算子 */
         WRef<OperatorObj> source;
         Blob data;
         Runtime runtime;

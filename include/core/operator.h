@@ -14,6 +14,7 @@ namespace infini
 
     protected:
         OpType type;
+        /* 算子的输入/输出张量 */
         TensorVec inputs;
         TensorVec outputs;
         vector<WRef<OperatorObj>> predecessors;
